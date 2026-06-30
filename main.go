@@ -12,6 +12,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
+	"sync"
 	"time"
 
 	"github.com/hajimehoshi/ebiten/v2"
@@ -102,6 +104,7 @@ type Game struct {
 	sp     sprites
 	events chan hook.Event
 
+	mu      sync.Mutex // 保护下面被监听 goroutine 与渲染共享的状态
 	lastKey time.Time
 	tapSide bool                 // false=左, true=右，每次按键翻转
 	recent  []time.Time          // 最近按键时间，用于判断打字速度
@@ -122,8 +125,11 @@ type Game struct {
 	tiltStartSkew, tiltStartSquash float64
 	showSettings                   bool
 
-	opaque bool
-	kbImg  *ebiten.Image // 键盘离屏图（用于倾斜贴回）
+	opaque   bool
+	kbImg    *ebiten.Image // 键盘离屏图（用于倾斜贴回）
+	babyOp   *ebiten.DrawImageOptions
+	kbOp     *ebiten.DrawImageOptions
+	downSnap map[uint16]bool // Draw 用的按下键快照（复用，避免每帧分配）
 
 	appDir    string
 	spriteDir string
@@ -193,10 +199,19 @@ func (g *Game) loadSprites() {
 		}
 		return img
 	}
-	g.sp.idle = load("idle.png")
-	g.sp.cry = load("cry.png")
-	g.sp.tapL = load("tap_left.png")
-	g.sp.tapR = load("tap_right.png")
+	// 先全部加载好新图，再释放旧纹理，避免重载时累积 GPU 资源。
+	ns := sprites{
+		idle: load("idle.png"),
+		cry:  load("cry.png"),
+		tapL: load("tap_left.png"),
+		tapR: load("tap_right.png"),
+	}
+	for _, im := range []*ebiten.Image{g.sp.idle, g.sp.cry, g.sp.tapL, g.sp.tapR} {
+		if im != nil {
+			im.Deallocate()
+		}
+	}
+	g.sp = ns
 }
 
 // ensureSpriteDir 建好外部文件夹，并把内置默认图导出（缺哪张补哪张）。
@@ -230,25 +245,15 @@ func openFolder(path string) {
 func (g *Game) Update() error {
 	now := time.Now()
 
-	// 1) 抽干全局键盘事件
-	for {
-		select {
-		case ev := <-g.events:
-			if ev.Kind == hook.KeyDown {
-				g.onKeyDown(ev, now)
-			}
-		default:
-			goto drained
-		}
-	}
-drained:
-
-	// 2) 清理过期高亮
+	// 1) 清理过期高亮，并判断是否仍在动画中（共享状态加锁）
+	g.mu.Lock()
 	for code, exp := range g.pressed {
 		if now.After(exp) {
 			delete(g.pressed, code)
 		}
 	}
+	animating := len(g.pressed) > 0 || now.Sub(g.lastKey) < idleAfter
+	g.mu.Unlock()
 
 	// 3) 左键按下：按优先级分派
 	if inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft) {
@@ -304,6 +309,10 @@ drained:
 		return ebiten.Termination
 	}
 
+	// 5) 仅在有动画/交互时请求下一帧；空闲时不出帧 → 渲染层零增长
+	if animating || g.dragging || g.kbDragging || g.tiltDragging || g.showSettings {
+		ebiten.ScheduleFrame()
+	}
 	return nil
 }
 
@@ -357,7 +366,23 @@ func (g *Game) handleSettingsClick(px, py int) bool {
 
 func panelHeight() int { return 10 + 3*(btnH+btnGap) + 58 }
 
-func (g *Game) onKeyDown(ev hook.Event, now time.Time) {
+// listen 在独立 goroutine 里消费全局键盘事件，并唤醒渲染。
+// 因为采用按需出帧(FPSModeVsyncOffMinimum)，空闲时 Update 不再运行，
+// 必须由这里 ScheduleFrame 把桌宠"叫醒"来播放反应动画。
+func (g *Game) listen() {
+	for ev := range g.events {
+		if ev.Kind != hook.KeyDown {
+			continue
+		}
+		g.mu.Lock()
+		g.applyKeyDown(ev, time.Now())
+		g.mu.Unlock()
+		ebiten.ScheduleFrame()
+	}
+}
+
+// applyKeyDown 必须在持有 g.mu 时调用。
+func (g *Game) applyKeyDown(ev hook.Event, now time.Time) {
 	if os.Getenv("KW_DEBUG") != "" {
 		log.Printf("KeyDown Keycode=%d", ev.Keycode)
 	}
@@ -378,7 +403,8 @@ func (g *Game) onKeyDown(ev hook.Event, now time.Time) {
 	g.pressed[ev.Keycode] = now.Add(tapHold)
 }
 
-func (g *Game) currentSprite(now time.Time) *ebiten.Image {
+// currentSpriteLocked 必须在持有 g.mu 时调用。
+func (g *Game) currentSpriteLocked(now time.Time) *ebiten.Image {
 	if now.Sub(g.lastKey) > idleAfter {
 		return g.sp.idle
 	}
@@ -400,11 +426,25 @@ func (g *Game) Draw(screen *ebiten.Image) {
 		screen.Fill(color.NRGBA{0xf2, 0xf2, 0xf4, 0xff})
 	}
 
+	// 取共享状态快照（加锁），避免与监听 goroutine 竞争
+	if g.downSnap == nil {
+		g.downSnap = map[uint16]bool{}
+	}
+	for k := range g.downSnap {
+		delete(g.downSnap, k)
+	}
+	g.mu.Lock()
+	spr := g.currentSpriteLocked(now)
+	for code := range g.pressed {
+		g.downSnap[code] = true
+	}
+	g.mu.Unlock()
+
 	// 娃
-	spr := g.currentSprite(now)
 	const babyW = 286.0
 	scale := babyW / 512.0
-	op := &ebiten.DrawImageOptions{}
+	op := g.babyOp
+	*op = ebiten.DrawImageOptions{}
 	op.GeoM.Scale(scale, scale)
 	op.GeoM.Translate((screenW-babyW)/2, -10)
 	screen.DrawImage(spr, op)
@@ -415,10 +455,11 @@ func (g *Game) Draw(screen *ebiten.Image) {
 		g.kbImg = ebiten.NewImage(kbW, kbH)
 	}
 	g.kbImg.Clear()
-	g.drawKeyboard(g.kbImg)
+	g.drawKeyboard(g.kbImg, g.downSnap)
 
 	const kbCX, kbCY = kbW / 2, 50.0
-	kop := &ebiten.DrawImageOptions{}
+	kop := g.kbOp
+	*kop = ebiten.DrawImageOptions{}
 	kop.GeoM.Translate(-kbCX, -kbCY)
 	kop.GeoM.Skew(g.skew, 0)
 	kop.GeoM.Scale(kbNarrow, g.squash)
@@ -483,7 +524,7 @@ func fillRoundRect(dst *ebiten.Image, x, y, w, h, r float32, clr color.Color) {
 	vector.DrawFilledCircle(dst, x+w-r, y+h-r, r, clr, true)
 }
 
-func (g *Game) drawKeyboard(screen *ebiten.Image) {
+func (g *Game) drawKeyboard(screen *ebiten.Image, down map[uint16]bool) {
 	const (
 		keyW   = 24.0
 		keyH   = 16.0
@@ -505,14 +546,14 @@ func (g *Game) drawKeyboard(screen *ebiten.Image) {
 	var y float32 = top
 	drawCap := func(x float32, w float32, label string, code uint16) {
 		const r = 4.5
-		_, down := g.pressed[code]
+		isDown := down[code]
 		topFill, sideFill := capTop, capSide
-		if down {
+		if isDown {
 			topFill, sideFill = downTop, downSide
 		}
 		fillRoundRect(screen, x, y+lip, w, keyH, r, sideFill)
 		ty := y
-		if down {
+		if isDown {
 			ty = y + lip
 		}
 		fillRoundRect(screen, x, ty, w, keyH, r, topFill)
@@ -548,6 +589,8 @@ func main() {
 		pressed:   map[uint16]time.Time{},
 		capCode:   map[rune]uint16{},
 		lastKey:   time.Now().Add(-time.Hour),
+		babyOp:    &ebiten.DrawImageOptions{},
+		kbOp:      &ebiten.DrawImageOptions{},
 		appDir:    dir,
 		spriteDir: filepath.Join(dir, "sprites"),
 	}
@@ -564,6 +607,25 @@ func main() {
 	}
 	g.capCode[' '] = hook.Keycode["space"]
 
+	// 兜底：定期把空闲内存还给系统，避免后台长时间运行 RSS 高水位
+	go func() {
+		for range time.Tick(30 * time.Second) {
+			debug.FreeOSMemory()
+		}
+	}()
+
+	// 诊断：KW_MEMLOG=1 定期打印内存/协程，帮助定位是否仍在增长
+	if os.Getenv("KW_MEMLOG") != "" {
+		go func() {
+			var m runtime.MemStats
+			for range time.Tick(10 * time.Second) {
+				runtime.ReadMemStats(&m)
+				log.Printf("MEM heapAlloc=%dKB heapSys=%dKB sys=%dKB goroutines=%d",
+					m.HeapAlloc/1024, m.HeapSys/1024, m.Sys/1024, runtime.NumGoroutine())
+			}
+		}()
+	}
+
 	// 全局键盘监听（需 macOS「输入监控」权限）；KW_NOHOOK=1 可跳过
 	if os.Getenv("KW_NOHOOK") == "" {
 		g.events = hook.Start()
@@ -571,11 +633,14 @@ func main() {
 	} else {
 		g.events = make(chan hook.Event)
 	}
+	go g.listen() // 独立 goroutine 消费按键并唤醒渲染
 
 	ebiten.SetWindowSize(screenW, screenH)
 	ebiten.SetWindowTitle("哭娃打字桌宠")
 	ebiten.SetWindowFloating(true)
 	ebiten.SetWindowResizingMode(ebiten.WindowResizingModeDisabled)
+	// 按需出帧：空闲时不渲染 → 渲染层零增长；靠 ScheduleFrame 唤醒
+	ebiten.SetFPSMode(ebiten.FPSModeVsyncOffMinimum)
 
 	transparent := os.Getenv("KW_OPAQUE") == ""
 	g.opaque = !transparent
