@@ -137,6 +137,14 @@ type Game struct {
 
 // ---------- 路径 / 配置 ----------
 
+// macOS 的 Metal 后端在部分系统上存在渲染层内存泄漏（nextDrawable 失败堆积），
+// 强制走 OpenGL 后端可绕开。仅在 darwin 且用户未手动指定时生效。
+func init() {
+	if runtime.GOOS == "darwin" && os.Getenv("EBITENGINE_GRAPHICS_LIBRARY") == "" {
+		_ = os.Setenv("EBITENGINE_GRAPHICS_LIBRARY", "opengl")
+	}
+}
+
 func appDir() string {
 	if exe, err := os.Executable(); err == nil {
 		return filepath.Dir(exe)
